@@ -1,118 +1,40 @@
-#include <cstdint>
-#include <Arduino.h>   
-
-/*
-#include <Arduino.h>    
-
-#define S0  32
-#define S1  33
-#define S2  34
-#define S3  35
-#define EN  12
-#define SIG 17
-
-int rowPins[4] = {13, 14, 27, 26};
-volatile int activeRow[8] = {0, 2, 1, 0, 3, 1, 2, 0};
-
-void selectColumn(uint8_t col) {
-    digitalWrite(S0, (col >> 0) & 1);
-    digitalWrite(S1, (col >> 1) & 1);
-    digitalWrite(S2, (col >> 2) & 1);
-    digitalWrite(S3, (col >> 3) & 1);
-}
-
-void IRAM_ATTR tdmRefresh() {
-    static uint8_t currentRow = 0;
-    for (int r = 0; r < 4; r++) digitalWrite(rowPins[r], LOW);
-    digitalWrite(EN, HIGH);
-
-    for (uint8_t col = 0; col < 8; col++) {
-        if (activeRow[col] == currentRow) {
-            selectColumn(col);
-            digitalWrite(SIG, LOW);
-            digitalWrite(EN, LOW);
-            delayMicroseconds(5);
-            digitalWrite(EN, HIGH);
-        }
-    }
-
-    digitalWrite(rowPins[currentRow], HIGH);
-    currentRow = (currentRow + 1) % 4;
-}
-
-void setup() {
-    Serial.begin(115200);
-
-    int pins[] = {S0, S1, S2, S3, EN, SIG};
-    for (int p : pins) { pinMode(p, OUTPUT); digitalWrite(p, HIGH); }
-    for (int r = 0; r < 4; r++) { pinMode(rowPins[r], OUTPUT); digitalWrite(rowPins[r], LOW); }
-
-    hw_timer_t *timer = timerBegin(0, 80, true);
-    timerAttachInterrupt(timer, &tdmRefresh, true);
-    timerAlarmWrite(timer, 500, true);
-    timerAlarmEnable(timer);
-}
-
-void loop() {
-    static uint32_t last = 0;
-    if (millis() - last > 500) {
-        // Move tile down — update activeRow here
-        activeRow[0] = (activeRow[0] + 1) % 4;
-        last = millis();
-    }
-}
-*/
-
-/*
- * Piano Tiles — Capacitive Touch Key Test
- * ESP32-DEVKITC-32UE
- *
- * Pins:  GPIO4  → Key 1 (T0)
- *        GPIO2  → Key 2 (T2)
- *        GPIO15 → Key 3 (T3)
- *        GPIO13 → Key 4 (T4)
- *        GPIO12 → Key 5 (T5)
- *        GPIO14 → Key 6 (T6)
- *        GPIO27 → Key 7 (T7)
- *        GPIO33 → Key 8 (T8)
- *
- * Open Serial Monitor at 115200 baud.
- * Touch a key → its label prints once per touch event.
- *
- * CALIBRATION:
- *   1. Run with nothing touching the keys.
- *   2. Observe the raw values printed for each pin.
- *   3. Set TOUCH_THRESHOLD below that idle value (lower = touched on ESP32).
- *      Typical idle: 60-80. Typical touched: 5-20.
- *      Start with 40 and tune from there.
- */
+#include <Adafruit_NeoPixel.h>
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 
-// Number of touch pins
-#define NUM_KEYS 8
+#define NUM_KEYS          8
+#define LEDS_PER_KEY      4          // 4 LEDs sit under each key
+#define LED_PIN           17
+#define LED_COUNT         (NUM_KEYS * LEDS_PER_KEY)  // 32 total
+#define LED_BRIGHTNESS    80         // 0-255 — keep low to protect USB power
 
-// Threshold: readings BELOW this are treated as a touch.
-// Lower the value → less sensitive (harder to trigger).
-// Raise the value → more sensitive (easier to trigger, more false positives).
-#define TOUCH_THRESHOLD 40
+#define TOUCH_THRESHOLD   40         // readings BELOW this = touched
+#define DEBOUNCE_MS       200
 
-// How long (ms) a key must stay untouched before it can fire again.
-// Prevents a single press from printing dozens of lines.
-#define DEBOUNCE_MS 200
+#define CALIBRATION_PRINT_MS 0       // set to e.g. 500 to see raw values
 
-// Print raw readings every N ms (set 0 to disable — use for calibration only).
-#define CALIBRATION_PRINT_MS 0   // e.g. change to 500 to see raw values
+// ─── Per-key colours (R, G, B) ──────────────────────────────────────────────
+// One vivid colour per key so you can instantly see which is active.
+
+const uint8_t KEY_COLORS[NUM_KEYS][3] = {
+    {255,   0,   0},   // Key 1 — Red
+    {255, 100,   0},   // Key 2 — Orange
+    {200, 200,   0},   // Key 3 — Yellow
+    {  0, 255,   0},   // Key 4 — Green
+    {  0, 200, 200},   // Key 5 — Cyan
+    {  0,   0, 255},   // Key 6 — Blue
+    {150,   0, 255},   // Key 7 — Purple
+    {255,   0, 150},   // Key 8 — Pink
+};
 
 // ─── Pin / Key Definitions ───────────────────────────────────────────────────
 
 struct TouchKey {
-    uint8_t     gpio;      // GPIO number
-    uint8_t     touchNum;  // Touch channel (Tx)
-    const char* label;     // Human-readable name
+    uint8_t     gpio;
+    uint8_t     touchNum;
+    const char* label;
 };
 
-// Order matches physical key layout left → right
 const TouchKey KEYS[NUM_KEYS] = {
     {  4,  0, "Key 1 (GPIO4 / T0)" },
     {  2,  2, "Key 2 (GPIO2 / T2)" },
@@ -124,30 +46,66 @@ const TouchKey KEYS[NUM_KEYS] = {
     { 33,  8, "Key 8 (GPIO33 / T8)" },
 };
 
-// ─── State ───────────────────────────────────────────────────────────────────
+// ─── Globals ─────────────────────────────────────────────────────────────────
+
+Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 
 bool     keyDown[NUM_KEYS]       = {false};
 uint32_t lastReleaseMs[NUM_KEYS] = {0};
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── LED Helpers ─────────────────────────────────────────────────────────────
 
-// Read the touch channel that belongs to a given key index.
-uint16_t readKey(uint8_t idx) {
-    return touchRead(KEYS[idx].gpio);
+// Light up all 4 LEDs for key index i in its colour.
+void keyLEDOn(uint8_t i) {
+    int base = i * LEDS_PER_KEY;
+    uint32_t col = strip.Color(KEY_COLORS[i][0],
+                               KEY_COLORS[i][1],
+                               KEY_COLORS[i][2]);
+    for (int l = 0; l < LEDS_PER_KEY; l++) {
+        strip.setPixelColor(base + l, col);
+    }
+    strip.show();
 }
+
+// Turn off all 4 LEDs for key index i.
+void keyLEDOff(uint8_t i) {
+    int base = i * LEDS_PER_KEY;
+    for (int l = 0; l < LEDS_PER_KEY; l++) {
+        strip.setPixelColor(base + l, 0);
+    }
+    strip.show();
+}
+
+// ─── Setup ───────────────────────────────────────────────────────────────────
 
 void setup() {
     Serial.begin(115200);
-    delay(2000);   // let USB-CDC settle
+
+    // Boot the LED strip first — all off
+    strip.begin();
+    strip.setBrightness(LED_BRIGHTNESS);
+    strip.clear();
+    strip.show();
+
+    // Brief startup animation: sweep each key colour across its LEDs
+    for (uint8_t i = 0; i < NUM_KEYS; i++) {
+        keyLEDOn(i);
+        delay(60);
+        keyLEDOff(i);
+    }
+
+    delay(1500);   // let Serial monitor connect
 
     Serial.println("===========================================");
-    Serial.println(" Piano Tiles — Touch Key Test");
+    Serial.println(" Piano Tiles — Touch + LED Test");
     Serial.println("===========================================");
-    Serial.printf(" Threshold : %d (lower = touched)\n", TOUCH_THRESHOLD);
-    Serial.printf(" Debounce  : %d ms\n", DEBOUNCE_MS);
+    Serial.printf(" Threshold  : %d  (lower = touched)\n", TOUCH_THRESHOLD);
+    Serial.printf(" Debounce   : %d ms\n", DEBOUNCE_MS);
+    Serial.printf(" LEDs/key   : %d  (%d total on GPIO%d)\n",
+                  LEDS_PER_KEY, LED_COUNT, LED_PIN);
     Serial.println("-------------------------------------------");
-    Serial.println(" Touch a key to test it. Raw values appear");
-    Serial.println(" if CALIBRATION_PRINT_MS > 0.");
+    Serial.println(" Touch a key → its LEDs light up.");
+    Serial.println(" Release    → LEDs turn off.");
     Serial.println("===========================================\n");
 }
 
@@ -157,23 +115,25 @@ void loop() {
     uint32_t now = millis();
 
     for (uint8_t i = 0; i < NUM_KEYS; i++) {
-        uint16_t raw     = readKey(i);
+        uint16_t raw     = touchRead(KEYS[i].gpio);
         bool     touched = (raw < TOUCH_THRESHOLD);
 
-        // ── Rising edge: finger just placed ──
+        // Rising edge — finger placed
         if (touched && !keyDown[i]) {
-            // Debounce: ignore if too soon after last release
             if ((now - lastReleaseMs[i]) >= DEBOUNCE_MS) {
                 keyDown[i] = true;
+                keyLEDOn(i);
+                Serial.printf({"Try to light up key %d\n"}, i + 1);
                 Serial.printf("  ▶  TOUCHED  %s  (raw=%d)\n",
                               KEYS[i].label, raw);
             }
         }
 
-        // ── Falling edge: finger lifted ──
+        // Falling edge — finger lifted
         if (!touched && keyDown[i]) {
             keyDown[i]       = false;
             lastReleaseMs[i] = now;
+            keyLEDOff(i);
             Serial.printf("     released %s\n", KEYS[i].label);
         }
     }
@@ -184,11 +144,11 @@ void loop() {
         lastPrint = now;
         Serial.print("[RAW]");
         for (uint8_t i = 0; i < NUM_KEYS; i++) {
-            Serial.printf("  K%d=%3d", i + 1, readKey(i));
+            Serial.printf("  K%d=%3d", i + 1, touchRead(KEYS[i].gpio));
         }
         Serial.println();
     }
 #endif
 
-    delay(10);   // ~100 Hz poll rate — plenty for human touch
+    delay(10);
 }
