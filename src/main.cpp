@@ -1,5 +1,5 @@
 /*
- * Piano Tiles — Touch + LED + Audio Test
+ * Piano Tiles — Game Mode
  * ESP32-DEVKITC-32UE
  *
  * Touch pins:
@@ -11,17 +11,27 @@
  * LEDs:  GPIO17 → WS2812B DIN, 32 LEDs (4 per key)
  *
  * Audio: MAX98357A I2S amplifier
- *   GPIO25 → LRCLK (LRC / WS)
- *   GPIO26 → BCLK
- *   GPIO22 → DIN
+ *   GPIO25 → LRCLK   GPIO26 → BCLK   GPIO22 → DIN
  *
- * Each key plays a note of the C major scale (C4–C5).
- * Touch → LED on + note plays for 300 ms.
- * Release has no effect on audio (note already finished).
+ * Display: TM1637 4-digit 7-segment
+ *   GPIO21 → CLK     GPIO16 → DIO
+ *
+ * Game: reads a sequence of key numbers, prompts player one at a time.
+ *       Hit within 2 s → +1 point. Miss → -5 points.
+ *       Score printed every second on Serial and TM1637 display.
  */
 
 #include <Adafruit_NeoPixel.h>
+#include <TM1637Display.h>
 #include <driver/i2s.h>
+#include <math.h>
+
+// ─── Display Configuration ───────────────────────────────────────────────────
+
+#define TM1637_CLK  21
+#define TM1637_DIO  16
+
+TM1637Display display(TM1637_CLK, TM1637_DIO);
 
 // ─── LED Configuration ───────────────────────────────────────────────────────
 
@@ -33,71 +43,105 @@
 
 // ─── Touch Configuration ─────────────────────────────────────────────────────
 
-#define TOUCH_THRESHOLD   40
-#define DEBOUNCE_MS       200
-#define CALIBRATION_PRINT_MS 0
+#define TOUCH_THRESHOLD   35
+#define DEBOUNCE_MS       50
 
 // ─── Audio Configuration ─────────────────────────────────────────────────────
 
-#define I2S_NUM         I2S_NUM_0
+#define I2S_NUM_PORT    I2S_NUM_0
 #define I2S_LRCLK       25
 #define I2S_BCLK        26
 #define I2S_DOUT        22
 
 #define SAMPLE_RATE     44100
-#define NOTE_DURATION_MS  300      // how long each note plays
-#define NOTE_AMPLITUDE  32000     // 0–32767; raise for louder, lower for quieter
+#define NOTE_AMPLITUDE  28000
+#define FADE_SAMPLES    882        // ~20 ms fade at 44100 Hz
 
-// C major scale: C4 D4 E4 F4 G4 A4 B4 C5
+// ─── Game Configuration ───────────────────────────────────────────────────────
+
+#define HIT_WINDOW_MS   3000
+#define POINTS_HIT      1
+#define POINTS_MISS     -1
+#define CALIBRATION_PRINT_MS 0
+
+const uint8_t SONG_SEQUENCE[] = {3, 2, 5, 5, 6, 3, 4, 7, 1, 6, 3, 6, 2, 8, 4};
+const int     SONG_LENGTH     = sizeof(SONG_SEQUENCE) / sizeof(SONG_SEQUENCE[0]);
+
+const char* NOTE_NAMES[NUM_KEYS] = {
+    "Do (C4)", "Re (D4)", "Mi (E4)", "Fa (F4)",
+    "Sol (G4)","La (A4)", "Ti (B4)", "Do (C5)"
+};
+
 const float KEY_FREQS[NUM_KEYS] = {
-    261.63f,   // C4 — Key 1
-    293.66f,   // D4 — Key 2
-    329.63f,   // E4 — Key 3
-    349.23f,   // F4 — Key 4
-    392.00f,   // G4 — Key 5
-    440.00f,   // A4 — Key 6
-    493.88f,   // B4 — Key 7
-    523.25f,   // C5 — Key 8
+    261.63f, 293.66f, 329.63f, 349.23f,
+    392.00f, 440.00f, 493.88f, 523.25f,
 };
 
 // ─── Per-key LED colours ──────────────────────────────────────────────────────
 
 const uint8_t KEY_COLORS[NUM_KEYS][3] = {
-    {255,   0,   0},   // Key 1 — Red
-    {255, 100,   0},   // Key 2 — Orange
-    {200, 200,   0},   // Key 3 — Yellow
-    {  0, 255,   0},   // Key 4 — Green
-    {  0, 200, 200},   // Key 5 — Cyan
-    {  0,   0, 255},   // Key 6 — Blue
-    {150,   0, 255},   // Key 7 — Purple
-    {255,   0, 150},   // Key 8 — Pink
+    {255,   0,   0},
+    {255, 100,   0},
+    {200, 200,   0},
+    {  0, 255,   0},
+    {  0, 200, 200},
+    {  0,   0, 255},
+    {150,   0, 255},
+    {255,   0, 150},
 };
 
 // ─── Pin / Key Definitions ───────────────────────────────────────────────────
 
 struct TouchKey {
     uint8_t     gpio;
-    uint8_t     touchNum;
     const char* label;
 };
 
 const TouchKey KEYS[NUM_KEYS] = {
-    {  4,  0, "Key 1 (GPIO4 / T0)" },
-    {  2,  2, "Key 2 (GPIO2 / T2)" },
-    { 15,  3, "Key 3 (GPIO15 / T3)" },
-    { 13,  4, "Key 4 (GPIO13 / T4)" },
-    { 12,  5, "Key 5 (GPIO12 / T5)" },
-    { 14,  6, "Key 6 (GPIO14 / T6)" },
-    { 27,  7, "Key 7 (GPIO27 / T7)" },
-    { 33,  8, "Key 8 (GPIO33 / T8)" },
+    {  4, "Key 1 (GPIO4 / T0)"  },
+    {  2, "Key 2 (GPIO2 / T2)"  },
+    { 15, "Key 3 (GPIO15 / T3)" },
+    { 33, "Key 4 (GPIO13 / T4)" },
+    { 27, "Key 5 (GPIO12 / T5)" },
+    { 14, "Key 6 (GPIO14 / T6)" },
+    { 12, "Key 7 (GPIO27 / T7)" },
+    { 13, "Key 8 (GPIO33 / T8)" },
 };
+
+// ─── Shared audio state ───────────────────────────────────────────────────────
+
+volatile bool keyActive[NUM_KEYS] = {false};
+
+// ─── Game state ──────────────────────────────────────────────────────────────
+
+int      score                   = 0;
+int      seqIndex                = 0;
+uint32_t promptStart             = 0;
+bool     waitingForHit           = false;
+bool     keyDown[NUM_KEYS]       = {false};
+uint32_t lastReleaseMs[NUM_KEYS] = {0};
 
 // ─── Globals ─────────────────────────────────────────────────────────────────
 
 Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 
-bool     keyDown[NUM_KEYS]       = {false};
-uint32_t lastReleaseMs[NUM_KEYS] = {0};
+// ─── Score display — defined first so all callers can use it ─────────────────
+
+void updateScore(int delta) {
+    score += delta;
+    if (score >= 0) {
+        display.showNumberDec(score, false);
+    } else {
+        // Leftmost digit = minus sign, remaining 3 digits = absolute value
+        uint8_t segs[4];
+        int abs_score = -score;
+        segs[0] = SEG_G;
+        segs[1] = display.encodeDigit((abs_score / 100) % 10);
+        segs[2] = display.encodeDigit((abs_score / 10)  % 10);
+        segs[3] = display.encodeDigit( abs_score        % 10);
+        display.setSegments(segs);
+    }
+}
 
 // ─── I2S Setup ───────────────────────────────────────────────────────────────
 
@@ -110,59 +154,61 @@ void i2sInit() {
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
         .intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1,
         .dma_buf_count        = 8,
-        .dma_buf_len          = 64,
+        .dma_buf_len          = 128,
         .use_apll             = false,
         .tx_desc_auto_clear   = true,
     };
-
     i2s_pin_config_t pins = {
         .bck_io_num   = I2S_BCLK,
         .ws_io_num    = I2S_LRCLK,
         .data_out_num = I2S_DOUT,
         .data_in_num  = I2S_PIN_NO_CHANGE,
     };
-
-    i2s_driver_install(I2S_NUM, &cfg, 0, NULL);
-    i2s_set_pin(I2S_NUM, &pins);
-    i2s_zero_dma_buffer(I2S_NUM);
+    i2s_driver_install(I2S_NUM_PORT, &cfg, 0, NULL);
+    i2s_set_pin(I2S_NUM_PORT, &pins);
+    i2s_zero_dma_buffer(I2S_NUM_PORT);
 }
 
-// ─── Audio: Play a sine-wave tone ────────────────────────────────────────────
-// Generates samples in a small stack buffer and writes them to I2S.
-// Blocks for NOTE_DURATION_MS ms then returns.
+// ─── Audio Task (Core 1) ──────────────────────────────────────────────────────
+void audioTask(void* param) {
+    const int   BUF_SAMPLES = 128;
+    int16_t buf[BUF_SAMPLES * 2];
+    float avgPhase    = 0.0f;
+    float avgPhaseInc = 0.0f;
 
-void playNote(float freqHz) {
-    const int totalSamples = (SAMPLE_RATE * NOTE_DURATION_MS) / 1000;
-    const int BUF_SAMPLES  = 256;          // samples per write chunk
-    int16_t   buf[BUF_SAMPLES * 2];        // stereo: L + R interleaved
-
-    int written = 0;
-    float phase = 0.0f;
-    float phaseInc = 2.0f * 3.14159265f * freqHz / (float)SAMPLE_RATE;
-
-    // Simple linear fade-out envelope to avoid clicks at note end
-    while (written < totalSamples) {
-        int chunk = min(BUF_SAMPLES, totalSamples - written);
-        for (int s = 0; s < chunk; s++) {
-            // Fade out over last 20% of the note
-            float env = 1.0f;
-            int remaining = totalSamples - written - s;
-            int fadeLen   = totalSamples / 5;
-            if (remaining < fadeLen) {
-                env = (float)remaining / (float)fadeLen;
+    while (true) {
+        // Compute average frequency of all active keys
+        float freqSum = 0.0f;
+        int   active  = 0;
+        for (int k = 0; k < NUM_KEYS; k++) {
+            if (keyActive[k]) {
+                freqSum += KEY_FREQS[k];
+                active++;
             }
-
-            int16_t sample = (int16_t)(NOTE_AMPLITUDE * sinf(phase) * env);
-            buf[s * 2]     = sample;   // Left
-            buf[s * 2 + 1] = sample;   // Right
-            phase += phaseInc;
-            if (phase > 2.0f * 3.14159265f) phase -= 2.0f * 3.14159265f;
         }
 
-        size_t bytesWritten = 0;
-        i2s_write(I2S_NUM, buf, chunk * 2 * sizeof(int16_t),
-                  &bytesWritten, portMAX_DELAY);
-        written += chunk;
+        if (active > 0) {
+            float avgFreq = freqSum / active;
+            avgPhaseInc   = M_TWOPI * avgFreq / (float)SAMPLE_RATE;
+        } else {
+            avgPhaseInc = 0.0f;
+        }
+
+        for (int i = 0; i < BUF_SAMPLES; i++) {
+            int16_t out = 0;
+            if (active > 0) {
+                out = (int16_t)(sinf(avgPhase) * NOTE_AMPLITUDE);
+                avgPhase += avgPhaseInc;
+                if (avgPhase > M_TWOPI) avgPhase -= M_TWOPI;
+            } else {
+                avgPhase = 0.0f;   // reset when silent — no residual buildup
+            }
+            buf[i * 2]     = out;
+            buf[i * 2 + 1] = out;
+        }
+
+        size_t bytesWritten;
+        i2s_write(I2S_NUM_PORT, buf, sizeof(buf), &bytesWritten, portMAX_DELAY);
     }
 }
 
@@ -170,21 +216,76 @@ void playNote(float freqHz) {
 
 void keyLEDOn(uint8_t i) {
     int base = i * LEDS_PER_KEY;
-    uint32_t col = strip.Color(KEY_COLORS[i][0],
-                               KEY_COLORS[i][1],
-                               KEY_COLORS[i][2]);
-    for (int l = 0; l < LEDS_PER_KEY; l++) {
-        strip.setPixelColor(base + l, col);
-    }
+    uint32_t col = strip.Color(KEY_COLORS[i][0], KEY_COLORS[i][1], KEY_COLORS[i][2]);
+    for (int l = 0; l < LEDS_PER_KEY; l++) strip.setPixelColor(base + l, col);
     strip.show();
 }
 
 void keyLEDOff(uint8_t i) {
     int base = i * LEDS_PER_KEY;
-    for (int l = 0; l < LEDS_PER_KEY; l++) {
-        strip.setPixelColor(base + l, 0);
-    }
+    for (int l = 0; l < LEDS_PER_KEY; l++) strip.setPixelColor(base + l, 0);
     strip.show();
+}
+
+void flashMiss() {
+    for (int l = 0; l < LED_COUNT; l++) strip.setPixelColor(l, strip.Color(60, 0, 0));
+    strip.show();
+    delay(200);
+    strip.clear();
+    strip.show();
+}
+
+// ─── Game Helpers ─────────────────────────────────────────────────────────────
+
+void promptNext() {
+    for (int k = 0; k < NUM_KEYS; k++) keyActive[k] = false;  // silence all
+
+    uint8_t keyIdx = SONG_SEQUENCE[seqIndex] - 1;
+    promptStart   = millis();
+    waitingForHit = true;
+    keyLEDOn(keyIdx);
+
+    Serial.println();
+    Serial.println("-------------------------------------------");
+    Serial.printf("  [%d/%d]  Press:  KEY %d — %s\n",
+                  seqIndex + 1, SONG_LENGTH,
+                  SONG_SEQUENCE[seqIndex], NOTE_NAMES[keyIdx]);
+    Serial.printf("  Score: %d   |   Time limit: %d ms\n", score, HIT_WINDOW_MS);
+    Serial.println("-------------------------------------------");
+}
+
+void registerHit(uint8_t keyIdx) {
+    uint32_t reaction = millis() - promptStart;
+    updateScore(POINTS_HIT);
+    keyActive[keyIdx] = true;
+    keyLEDOn(keyIdx);
+
+    Serial.printf("  ✓  HIT!  reaction=%d ms   score=%d\n", reaction, score);
+
+    delay(300);
+    keyActive[keyIdx] = false;
+    keyLEDOff(keyIdx);
+
+    // Wait for finger to lift
+    Serial.println("  (lift finger...)");
+    while (touchRead(KEYS[keyIdx].gpio) < TOUCH_THRESHOLD) {
+        delay(10);
+    }
+    delay(DEBOUNCE_MS);
+
+    waitingForHit = false;
+    seqIndex++;
+}
+
+void registerMiss(uint8_t keyIdx) {
+    updateScore(POINTS_MISS);         // updates score + display
+    keyLEDOff(keyIdx);
+    flashMiss();
+
+    Serial.printf("  ✗  MISS!  score=%d\n", score);
+
+    waitingForHit = false;
+    seqIndex++;
 }
 
 // ─── Setup ───────────────────────────────────────────────────────────────────
@@ -192,77 +293,164 @@ void keyLEDOff(uint8_t i) {
 void setup() {
     Serial.begin(115200);
 
-    // LED strip init
+    display.setBrightness(5);
+    display.showNumberDec(0, false);
+
     strip.begin();
     strip.setBrightness(LED_BRIGHTNESS);
     strip.clear();
     strip.show();
 
-    // I2S / audio init
     i2sInit();
+    xTaskCreatePinnedToCore(audioTask, "audio", 4096, NULL, 5, NULL, 1);
 
-    // Startup sweep — lights + a quick ascending scale
+    // Startup sweep
     for (uint8_t i = 0; i < NUM_KEYS; i++) {
+        keyActive[i] = true;
         keyLEDOn(i);
-        playNote(KEY_FREQS[i]);   // NOTE_DURATION_MS each
+        delay(200);
+        keyActive[i] = false;
         keyLEDOff(i);
+        delay(30);
     }
 
-    delay(500);
+    Serial.println("===========================================");
+    Serial.println("       Piano Tiles — Game Mode");
+    Serial.println("===========================================");
+    Serial.printf(" Sequence length : %d keys\n", SONG_LENGTH);
+    Serial.printf(" Hit window      : %d ms\n",   HIT_WINDOW_MS);
+    Serial.printf(" Hit reward      : +%d\n",     POINTS_HIT);
+    Serial.printf(" Miss penalty    : %d\n",      POINTS_MISS);
+    Serial.println("===========================================");
+    delay(1000);
 
-    Serial.println("===========================================");
-    Serial.println(" Piano Tiles — Touch + LED + Audio Test");
-    Serial.println("===========================================");
-    Serial.printf(" Threshold  : %d  (lower = touched)\n", TOUCH_THRESHOLD);
-    Serial.printf(" Debounce   : %d ms\n", DEBOUNCE_MS);
-    Serial.printf(" LEDs/key   : %d  (%d total on GPIO%d)\n",
-                  LEDS_PER_KEY, LED_COUNT, LED_PIN);
-    Serial.println(" Audio      : MAX98357A on GPIO25/26/22");
-    Serial.println("-------------------------------------------");
-    Serial.println(" Touch a key → LED on + note plays.");
-    Serial.println("===========================================\n");
+    promptNext();
 }
 
-// ─── Main Loop ───────────────────────────────────────────────────────────────
+// ─── Main Loop (Core 0) ──────────────────────────────────────────────────────
 
 void loop() {
     uint32_t now = millis();
 
-    for (uint8_t i = 0; i < NUM_KEYS; i++) {
-        uint16_t raw     = touchRead(KEYS[i].gpio);
-        bool     touched = (raw < TOUCH_THRESHOLD);
+    // ── Score ticker: Serial print once per second ────────────────────────────
+    static uint32_t lastScorePrint = 0;
+    if (now - lastScorePrint >= 1000) {
+        lastScorePrint = now;
+        if (waitingForHit) {
+            uint32_t remaining = HIT_WINDOW_MS - (now - promptStart);
+            Serial.printf("  [score: %d]  time left: %d ms\n", score, remaining);
+        }
+    }
 
-        // Rising edge — finger placed
-        if (touched && !keyDown[i]) {
-            if ((now - lastReleaseMs[i]) >= DEBOUNCE_MS) {
-                keyDown[i] = true;
+    // ── Game over ─────────────────────────────────────────────────────────────
+    // ── Game over ─────────────────────────────────────────────────────────────
+if (seqIndex >= SONG_LENGTH) {
+    Serial.println("\n===========================================");
+    Serial.println("           GAME OVER");
+    Serial.printf("   Final score: %d / %d\n", score, SONG_LENGTH * POINTS_HIT);
+    Serial.println("===========================================");
+    display.showNumberDec(score, false);
+    for (int t = 0; t < 3; t++) {
+        for (int l = 0; l < LED_COUNT; l++)
+            strip.setPixelColor(l, strip.Color(80, 80, 80));
+        strip.show(); delay(300);
+        strip.clear(); strip.show(); delay(200);
+    }
+
+    // ── Debug loop — print pressed keys in real time ──────────────────────
+    Serial.println("\n--- DEBUG MODE — press any key ---");
+    Serial.println("    (raw values printed every 200 ms)");
+    Serial.println("----------------------------------");
+
+    bool dbgKeyDown[NUM_KEYS] = {false};
+
+    while (true) {
+        // Raw value dump every 200 ms
+        static uint32_t lastRaw = 0;
+        uint32_t t2 = millis();
+        if (t2 - lastRaw >= 200) {
+            lastRaw = t2;
+            Serial.print("[RAW] ");
+            for (uint8_t i = 0; i < NUM_KEYS; i++) {
+                Serial.printf("K%d=%3d  ", i + 1, touchRead(KEYS[i].gpio));
+            }
+            Serial.println();
+        }
+
+        // Edge detection — print on press and release
+        for (uint8_t i = 0; i < NUM_KEYS; i++) {
+            uint16_t raw     = touchRead(KEYS[i].gpio);
+            bool     touched = (raw < TOUCH_THRESHOLD);
+
+            if (touched && !dbgKeyDown[i]) {
+                dbgKeyDown[i] = true;
+                keyActive[i]  = true;   // play the note
                 keyLEDOn(i);
-                Serial.printf("  ▶  TOUCHED  %s  (raw=%d)\n",
-                              KEYS[i].label, raw);
-                playNote(KEY_FREQS[i]);   // blocks for NOTE_DURATION_MS
+                Serial.printf("  ▼  PRESS   Key %d — %s  (raw=%d)\n",
+                              i + 1, NOTE_NAMES[i], raw);
+            }
+
+            if (!touched && dbgKeyDown[i]) {
+                dbgKeyDown[i] = false;
+                keyActive[i]  = false;  // stop the note
                 keyLEDOff(i);
+                Serial.printf("  ▲  RELEASE Key %d  (raw=%d)\n",
+                              i + 1, raw);
             }
         }
 
-        // Falling edge — finger lifted
-        if (!touched && keyDown[i]) {
-            keyDown[i]       = false;
-            lastReleaseMs[i] = now;
-            Serial.printf("     released %s\n", KEYS[i].label);
+        delay(10);
+    }
+}
+
+    // ── Miss detection ────────────────────────────────────────────────────────
+    if (waitingForHit && (now - promptStart) >= HIT_WINDOW_MS) {
+        uint8_t keyIdx = SONG_SEQUENCE[seqIndex] - 1;
+        registerMiss(keyIdx);
+        if (seqIndex < SONG_LENGTH) promptNext();
+        return;
+    }
+
+    // ── Touch polling ─────────────────────────────────────────────────────────
+    if (waitingForHit) {
+        uint8_t targetKey = SONG_SEQUENCE[seqIndex] - 1;
+
+        for (uint8_t i = 0; i < NUM_KEYS; i++) {
+            uint16_t raw     = touchRead(KEYS[i].gpio);
+            bool     touched = (raw < TOUCH_THRESHOLD);
+
+            if (touched && !keyDown[i]) {
+                if ((now - lastReleaseMs[i]) >= DEBOUNCE_MS) {
+                    keyDown[i] = true;
+
+                    if (i == targetKey) {
+                        registerHit(i);
+                        if (seqIndex < SONG_LENGTH) promptNext();
+                        return;
+                    } else {
+                        Serial.printf("  ✗  Wrong key %d (need %d)\n",
+                                      i + 1, targetKey + 1);
+                    }
+                }
+            }
+
+            if (!touched && keyDown[i]) {
+                keyDown[i]       = false;
+                lastReleaseMs[i] = now;
+            }
         }
     }
 
-#if CALIBRATION_PRINT_MS > 0
-    static uint32_t lastPrint = 0;
-    if (now - lastPrint >= CALIBRATION_PRINT_MS) {
-        lastPrint = now;
-        Serial.print("[RAW]");
+    // TEMP: calibration print — remove after tuning
+    static uint32_t lastCal = 0;
+    if (now - lastCal >= 500) {
+        lastCal = now;
+        Serial.print("[RAW] ");
         for (uint8_t i = 0; i < NUM_KEYS; i++) {
-            Serial.printf("  K%d=%3d", i + 1, touchRead(KEYS[i].gpio));
+            Serial.printf("K%d=%3d  ", i + 1, touchRead(KEYS[i].gpio));
         }
         Serial.println();
     }
-#endif
 
     delay(10);
 }
