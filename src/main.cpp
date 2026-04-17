@@ -1,25 +1,3 @@
-/*
- * Piano Tiles — Game Mode
- * ESP32-DEVKITC-32UE
- *
- * Touch pins:
- *   GPIO4  → Key 1   GPIO13 → Key 4
- *   GPIO2  → Key 2   GPIO12 → Key 5
- *   GPIO15 → Key 3   GPIO14 → Key 6
- *   GPIO27 → Key 7   GPIO33 → Key 8
- *
- * LEDs:  GPIO17 → WS2812B DIN, 32 LEDs (4 per key)
- *
- * Audio: MAX98357A I2S amplifier
- *   GPIO25 → LRCLK   GPIO26 → BCLK   GPIO22 → DIN
- *
- * Display: TM1637 4-digit 7-segment
- *   GPIO21 → CLK     GPIO16 → DIO
- *
- * Game: reads a sequence of key numbers, prompts player one at a time.
- *       Hit within 2 s → +1 point. Miss → -5 points.
- *       Score printed every second on Serial and TM1637 display.
- */
 
 #include <Adafruit_NeoPixel.h>
 #include <TM1637Display.h>
@@ -91,7 +69,6 @@ const uint8_t KEY_COLORS[NUM_KEYS][3] = {
 };
 
 // ─── Pin / Key Definitions ───────────────────────────────────────────────────
-
 struct TouchKey {
     uint8_t     gpio;
     const char* label;
@@ -454,3 +431,31 @@ if (seqIndex >= SONG_LENGTH) {
 
     delay(10);
 }
+    
+   /*
+#include <Arduino.h>
+#include <Adafruit_NeoPixel.h>
+
+#define LED_PIN   19
+#define LED_COUNT 100
+
+Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+void setup() {
+    strip.begin();
+    strip.setBrightness(80);
+    strip.clear();
+
+    int leds[] = {0, 2, 4, 6, 11, 13, 15, 17, 21, 23, 25, 27, 32, 34, 36, 38, 42, 44, 46, 48, 53, 55, 57, 59, 63, 65, 67, 69, 74, 76, 78, 80};
+    int count = sizeof(leds) / sizeof(leds[0]);
+
+    for (int i = 0; i < count; i++) {
+        strip.setPixelColor(leds[i], strip.Color(255, 255, 255));
+    }
+    strip.show();
+}
+
+void loop() {
+    // Nothing needed here, LEDs stay on from setup()
+} 
+    */
