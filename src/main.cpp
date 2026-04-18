@@ -1,154 +1,173 @@
 #include <Adafruit_NeoPixel.h>
+#include <math.h>
 
-// ─── Configuration ──────────────────────────────────────────────────────────
-
-#define NUM_KEYS          8
-#define LEDS_PER_KEY      4          // 4 LEDs sit under each key
-#define LED_PIN           17
-#define LED_COUNT         (NUM_KEYS * LEDS_PER_KEY)  // 32 total
-#define LED_BRIGHTNESS    80         // 0-255 — keep low to protect USB power
-
-#define TOUCH_THRESHOLD   40         // readings BELOW this = touched
-#define DEBOUNCE_MS       200
-
-#define CALIBRATION_PRINT_MS 0       // set to e.g. 500 to see raw values
-
-// ─── Per-key colours (R, G, B) ──────────────────────────────────────────────
-// One vivid colour per key so you can instantly see which is active.
-
-const uint8_t KEY_COLORS[NUM_KEYS][3] = {
-    {255,   0,   0},   // Key 1 — Red
-    {255, 100,   0},   // Key 2 — Orange
-    {200, 200,   0},   // Key 3 — Yellow
-    {  0, 255,   0},   // Key 4 — Green
-    {  0, 200, 200},   // Key 5 — Cyan
-    {  0,   0, 255},   // Key 6 — Blue
-    {150,   0, 255},   // Key 7 — Purple
-    {255,   0, 150},   // Key 8 — Pink
-};
-
-// ─── Pin / Key Definitions ───────────────────────────────────────────────────
-
-struct TouchKey {
-    uint8_t     gpio;
-    uint8_t     touchNum;
-    const char* label;
-};
-
-const TouchKey KEYS[NUM_KEYS] = {
-    {  4,  0, "Key 1 (GPIO4 / T0)" },
-    {  2,  2, "Key 2 (GPIO2 / T2)" },
-    { 15,  3, "Key 3 (GPIO15 / T3)" },
-    { 13,  4, "Key 4 (GPIO13 / T4)" },
-    { 12,  5, "Key 5 (GPIO12 / T5)" },
-    { 14,  6, "Key 6 (GPIO14 / T6)" },
-    { 27,  7, "Key 7 (GPIO27 / T7)" },
-    { 33,  8, "Key 8 (GPIO33 / T8)" },
-};
-
-// ─── Globals ─────────────────────────────────────────────────────────────────
+#define LED_PIN     19
+#define LED_COUNT   100
+#define BRIGHTNESS  200
 
 Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 
-bool     keyDown[NUM_KEYS]       = {false};
-uint32_t lastReleaseMs[NUM_KEYS] = {0};
+const int ledMatrix[4][8] = {
+  {0,17,21,38,42,59,63,80},
+  {2,15,23,36,44,57,65,78},
+  {4,13,25,34,46,55,67,76},
+  {6,11,27,32,48,53,69,74}
+};
 
-// ─── LED Helpers ─────────────────────────────────────────────────────────────
+struct Note {
+  int col;
+  float pos;
+  bool active;
+  int hitState;
+};
 
-// Light up all 4 LEDs for key index i in its colour.
-void keyLEDOn(uint8_t i) {
-    int base = i * LEDS_PER_KEY;
-    uint32_t col = strip.Color(KEY_COLORS[i][0],
-                               KEY_COLORS[i][1],
-                               KEY_COLORS[i][2]);
-    for (int l = 0; l < LEDS_PER_KEY; l++) {
-        strip.setPixelColor(base + l, col);
-    }
-    strip.show();
+#define MAX_NOTES 30
+Note notes[MAX_NOTES];
+
+const int TOUCH_PINS[8] = {4,2,15,33,27,14,12,13};
+const int TOUCH_THRESHOLD = 35;
+
+unsigned long lastMove  = 0;
+unsigned long lastSpawn = 0;
+
+const int   moveInterval  = 30;
+const int   spawnInterval = 800;
+const float speed         = 0.04f;
+
+const float HIT_START = 2.0f;
+const float HIT_END   = 4.0f;
+
+// ★ NEW: timestamp per column for wrong-press red flash
+unsigned long wrongPressTime[8] = {0};
+const unsigned long WRONG_FLASH_MS = 300;
+
+void allOff() {
+  for (int i = 0; i < LED_COUNT; i++) strip.setPixelColor(i, 0);
 }
 
-// Turn off all 4 LEDs for key index i.
-void keyLEDOff(uint8_t i) {
-    int base = i * LEDS_PER_KEY;
-    for (int l = 0; l < LEDS_PER_KEY; l++) {
-        strip.setPixelColor(base + l, 0);
+void spawnNotes() {
+  int count = random(1, 3);
+  for (int i = 0; i < count; i++) {
+    int col = random(0, 8);
+    for (int j = 0; j < MAX_NOTES; j++) {
+      if (!notes[j].active) {
+        notes[j].active   = true;
+        notes[j].col      = col;
+        notes[j].pos      = 0.0f;
+        notes[j].hitState = 0;
+        break;
+      }
     }
-    strip.show();
+  }
 }
 
-// ─── Setup ───────────────────────────────────────────────────────────────────
+void updateNotes() {
+  for (int i = 0; i < MAX_NOTES; i++) {
+    if (!notes[i].active) continue;
+    notes[i].pos += speed;
+    if (notes[i].hitState == 0 && notes[i].pos > HIT_END) {
+      notes[i].hitState = 2;
+    }
+    if (notes[i].pos > 4.5f) notes[i].active = false;
+  }
+}
+
+void checkTouch() {
+  bool touched[8] = {false};
+  for (int c = 0; c < 8; c++) {
+    if (touchRead(TOUCH_PINS[c]) < TOUCH_THRESHOLD) touched[c] = true;
+  }
+
+  for (int i = 0; i < MAX_NOTES; i++) {
+    if (!notes[i].active || notes[i].hitState != 0) continue;
+    if (notes[i].pos < HIT_START || notes[i].pos > HIT_END) continue;
+
+    int target = notes[i].col;
+    if (touched[target]) notes[i].hitState = 1;
+    for (int c = 0; c < 8; c++) {
+      if (c != target && touched[c]) notes[i].hitState = 2;
+    }
+  }
+
+  // ★ FIXED: record timestamp instead of writing pixel directly
+  for (int c = 0; c < 8; c++) {
+    if (!touched[c]) continue;
+    bool hasHittable = false;
+    for (int i = 0; i < MAX_NOTES; i++) {
+      if (!notes[i].active) continue;
+      if (notes[i].col != c) continue;
+      if (notes[i].pos >= HIT_START && notes[i].pos <= HIT_END) {
+        hasHittable = true;
+        break;
+      }
+    }
+    if (!hasHittable) wrongPressTime[c] = millis();
+  }
+
+  delay(20);
+}
+
+void render() {
+  allOff();
+
+  for (int i = 0; i < MAX_NOTES; i++) {
+    if (!notes[i].active) continue;
+
+    int   col = notes[i].col;
+    float p   = notes[i].pos;
+    int   hit = notes[i].hitState;
+
+    for (int row = 0; row < 4; row++) {
+      float delta = p - row;
+      uint8_t bri = 0;
+      if (delta >= -1.0f && delta <= 1.0f) {
+        bri = (uint8_t)(255.0f * (1.0f - fabs(delta)));
+      }
+      if (bri == 0) continue;
+
+      int led = ledMatrix[row][col];
+      if (row == 3) {
+        if      (hit == 1) strip.setPixelColor(led, 0,   bri, 0  );
+        else if (hit == 2) strip.setPixelColor(led, bri, 0,   0  );
+        else               strip.setPixelColor(led, bri, bri, bri);
+      } else {
+        strip.setPixelColor(led, bri, bri, bri);
+      }
+    }
+  }
+
+  // ★ FIXED: draw wrong-press red last so it overwrites everything
+  unsigned long now = millis();
+  for (int c = 0; c < 8; c++) {
+    if (wrongPressTime[c] > 0 && (now - wrongPressTime[c]) < WRONG_FLASH_MS) {
+      strip.setPixelColor(ledMatrix[3][c], 255, 0, 0);
+    }
+  }
+
+  strip.show();
+}
 
 void setup() {
-    Serial.begin(115200);
-
-    // Boot the LED strip first — all off
-    strip.begin();
-    strip.setBrightness(LED_BRIGHTNESS);
-    strip.clear();
-    strip.show();
-
-    // Brief startup animation: sweep each key colour across its LEDs
-    for (uint8_t i = 0; i < NUM_KEYS; i++) {
-        keyLEDOn(i);
-        delay(60);
-        keyLEDOff(i);
-    }
-
-    delay(1500);   // let Serial monitor connect
-
-    Serial.println("===========================================");
-    Serial.println(" Piano Tiles — Touch + LED Test");
-    Serial.println("===========================================");
-    Serial.printf(" Threshold  : %d  (lower = touched)\n", TOUCH_THRESHOLD);
-    Serial.printf(" Debounce   : %d ms\n", DEBOUNCE_MS);
-    Serial.printf(" LEDs/key   : %d  (%d total on GPIO%d)\n",
-                  LEDS_PER_KEY, LED_COUNT, LED_PIN);
-    Serial.println("-------------------------------------------");
-    Serial.println(" Touch a key → its LEDs light up.");
-    Serial.println(" Release    → LEDs turn off.");
-    Serial.println("===========================================\n");
+  strip.begin();
+  strip.setBrightness(BRIGHTNESS);
+  strip.clear();
+  strip.show();
+  randomSeed(analogRead(A0));
+  for (int i = 0; i < MAX_NOTES; i++) notes[i].active = false;
 }
 
-// ─── Main Loop ───────────────────────────────────────────────────────────────
-
 void loop() {
-    uint32_t now = millis();
+  unsigned long now = millis();
 
-    for (uint8_t i = 0; i < NUM_KEYS; i++) {
-        uint16_t raw     = touchRead(KEYS[i].gpio);
-        bool     touched = (raw < TOUCH_THRESHOLD);
+  if (now - lastMove >= moveInterval) {
+    lastMove = now;
+    updateNotes();
+  }
+  if (now - lastSpawn >= spawnInterval) {
+    lastSpawn = now;
+    spawnNotes();
+  }
 
-        // Rising edge — finger placed
-        if (touched && !keyDown[i]) {
-            if ((now - lastReleaseMs[i]) >= DEBOUNCE_MS) {
-                keyDown[i] = true;
-                keyLEDOn(i);
-                Serial.printf({"Try to light up key %d\n"}, i + 1);
-                Serial.printf("  ▶  TOUCHED  %s  (raw=%d)\n",
-                              KEYS[i].label, raw);
-            }
-        }
-
-        // Falling edge — finger lifted
-        if (!touched && keyDown[i]) {
-            keyDown[i]       = false;
-            lastReleaseMs[i] = now;
-            keyLEDOff(i);
-            Serial.printf("     released %s\n", KEYS[i].label);
-        }
-    }
-
-#if CALIBRATION_PRINT_MS > 0
-    static uint32_t lastPrint = 0;
-    if (now - lastPrint >= CALIBRATION_PRINT_MS) {
-        lastPrint = now;
-        Serial.print("[RAW]");
-        for (uint8_t i = 0; i < NUM_KEYS; i++) {
-            Serial.printf("  K%d=%3d", i + 1, touchRead(KEYS[i].gpio));
-        }
-        Serial.println();
-    }
-#endif
-
-    delay(10);
+  checkTouch();
+  render();
 }
