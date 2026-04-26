@@ -1,53 +1,49 @@
-
 #include <Adafruit_NeoPixel.h>
 #include <math.h>
 #include <TM1637Display.h>
 #include <driver/i2s.h> 
 
-#define LED_PIN     17
+#define LED_PIN     17  
 #define LED_COUNT   100
 #define BRIGHTNESS  200
 
-#define CLK 21
-#define DIO 5
+#define CLK 0
+#define DIO 16
 TM1637Display display(CLK, DIO);
 
-// I2S 放大器引脚配置
 #define I2S_NUM_PORT    I2S_NUM_0
 #define I2S_LRCLK       25
 #define I2S_BCLK        26
 #define I2S_DOUT        22
 #define SAMPLE_RATE     44100
-#define NOTE_AMPLITUDE  20000 
+#define NOTE_AMPLITUDE  30000 
 
-// ─── 提前声明函数 ────────────────────────────────────────────────────────
 void render();
 void updateScoreDisplay();
 void playTone(float freq, int dur);
 void initFourNotes();
+void checkGameState();
 
-// ─── 游戏状态机定义 ──────────────────────────────────────────────────────
-enum GameState { STATE_MENU, STATE_PLAYING, STATE_WIN };
+enum GameState { STATE_MENU, STATE_PLAYING, STATE_WIN, STATE_GAMEOVER };
 GameState gameState = STATE_MENU;
 
 int score = 0;
-unsigned long winStartTime = 0;
+int maxScoreReached = 0; 
+unsigned long stateStartTime = 0;
 
-// ─── 音符频率定义 ────────────────────────────────────────────────────────
 const float KEY_FREQS[8] = {
   261.63f, 293.66f, 329.63f, 349.23f, // Do, Re, Mi, Fa
-  392.00f, 440.00f, 493.88f, 523.25f, // Sol, La, Ti, Do(高)
+  392.00f, 440.00f, 493.88f, 523.25f, // Sol, La, Ti, Do
 };
 
-// ─── 8首曲库定义 (1-8 对应不同音高) ──────────────────────────────────────
-const int S1[] = {1,1,5,5,6,6,5, 4,4,3,3,2,2,1}; // 1. 小星星
-const int S2[] = {3,3,4,5,5,4,3,2, 1,1,2,3,3,2,2}; // 2. 欢乐颂
-const int S3[] = {3,2,1,2,3,3,3, 2,2,2, 3,5,5}; // 3. 玛丽有只小绵羊
-const int S4[] = {5,6,5,4,3,4,5, 2,3,4, 3,4,5}; // 4. 伦敦桥
-const int S5[] = {3,3,3, 3,3,3, 3,5,1,2,3}; // 5. 铃儿响叮当
-const int S6[] = {1,2,3,1, 1,2,3,1, 3,4,5, 3,4,5}; // 6. 两只老虎
-const int S7[] = {1,1,1,2,3, 3,2,3,4,5}; // 7. 划小船
-const int S8[] = {5,3,3, 4,2,2, 1,2,3,4,5,5,5}; // 8. 粉刷匠
+const int S1[] = {1,1,5,5,6,6,5, 4,4,3,3,2,2,1}; 
+const int S2[] = {3,3,4,5,5,4,3,2, 1,1,2,3,3,2,2}; 
+const int S3[] = {3,2,1,2,3,3,3, 2,2,2, 3,5,5}; 
+const int S4[] = {5,6,5,4,3,4,5, 2,3,4, 3,4,5};
+const int S5[] = {3,3,3, 3,3,3, 3,5,1,2,3}; 
+const int S6[] = {1,2,3,1, 1,2,3,1, 3,4,5, 3,4,5}; 
+const int S7[] = {1,1,1,2,3, 3,2,3,4,5}; 
+const int S8[] = {5,3,3, 4,2,2, 1,2,3,4,5,5,5}; 
 
 const int* SONGS[8] = {S1, S2, S3, S4, S5, S6, S7, S8};
 const int SONG_LENGTHS[8] = {
@@ -58,7 +54,6 @@ const int SONG_LENGTHS[8] = {
 int currentSong = 0;
 int meledyPtr = 0;
 
-// ─── 硬件设置 ──────────────────────────────────────────────────────────
 Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 
 const int ledMatrix[4][8] = {
@@ -78,7 +73,6 @@ Note notes[MAX_NOTES];
 const int TOUCH_PINS[8] = {4,2,15,33,27,14,12,13};
 const int TOUCH_THRESHOLD = 35;
 
-// 全局按键状态（防止状态切换时误触）
 bool keyJustPressed[8] = {false};
 
 unsigned long lastMove = 0;
@@ -93,7 +87,36 @@ const unsigned long WRONG_FLASH_MS = 300;
 volatile float targetFreq = 0.0f;
 volatile uint32_t soundStopTime = 0;
 
-// ─── I2S 音频后台任务 ──────────────────────────────────────────────────
+
+uint8_t flipSegment(uint8_t seg) {
+  uint8_t flipped = 0;
+  if (seg & 0x01) flipped |= 0x08; 
+  if (seg & 0x02) flipped |= 0x10; 
+  if (seg & 0x04) flipped |= 0x20; 
+  if (seg & 0x08) flipped |= 0x01;
+  if (seg & 0x10) flipped |= 0x02;
+  if (seg & 0x20) flipped |= 0x04; 
+  if (seg & 0x40) flipped |= 0x40; 
+  return flipped;
+}
+
+void showNumberUpsideDown(int val) {
+  uint8_t segments[4] = {0, 0, 0, 0};
+  
+  if (val == 0) {
+    segments[0] = flipSegment(display.encodeDigit(0));
+  } else {
+    int temp = val;
+    for (int i = 0; i < 4; i++) {
+      if (temp > 0) {
+        segments[i] = flipSegment(display.encodeDigit(temp % 10));
+        temp /= 10;
+      }
+    }
+  }
+  display.setSegments(segments);
+}
+
 void i2sInit() {
     i2s_config_t cfg = {
         .mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
@@ -141,7 +164,6 @@ void audioTask(void* param) {
     }
 }
 
-// ─── 核心功能函数 ────────────────────────────────────────────────────────
 void playTone(float freq, int dur) {
   targetFreq = freq; soundStopTime = millis() + dur; 
 }
@@ -153,8 +175,9 @@ void playNextSongNote() {
 }
 
 void updateScoreDisplay() {
-  if (score < 0) score = 0; 
-  display.showNumberDec(score, false);
+  if (score >= 0) {
+    showNumberUpsideDown(score);
+  }
 }
 
 void allOff() {
@@ -171,81 +194,98 @@ void initFourNotes() {
   }
 }
 
-// ─── 统一读取按键 ────────────────────────────────────────────────────────
 void readInputs() {
   static bool lastState[8] = {false};
   for(int i=0; i<8; i++) {
     bool current = (touchRead(TOUCH_PINS[i]) < TOUCH_THRESHOLD);
-    keyJustPressed[i] = (current && !lastState[i]); // 只有按下的瞬间才为 true
+    keyJustPressed[i] = (current && !lastState[i]); 
     lastState[i] = current;
   }
 }
 
-// ─── 游戏菜单 (选歌界面) ─────────────────────────────────────────────────
+void checkGameState() {
+  if (score > maxScoreReached) {
+    maxScoreReached = score;
+  }
+
+  if (score >= 150) { 
+    gameState = STATE_WIN;
+    stateStartTime = millis();
+    playTone(KEY_FREQS[0], 100); delay(100);
+    playTone(KEY_FREQS[2], 100); delay(100);
+    playTone(KEY_FREQS[4], 100); delay(100);
+    playTone(KEY_FREQS[7], 400); 
+  } 
+  else if (score < 0) {
+    if (maxScoreReached >= 10) { 
+      gameState = STATE_GAMEOVER;
+      stateStartTime = millis();
+      playTone(KEY_FREQS[7], 150); delay(150);
+      playTone(KEY_FREQS[4], 150); delay(150);
+      playTone(KEY_FREQS[2], 150); delay(150);
+      playTone(KEY_FREQS[0], 400);
+    } else {
+      score = 0;
+      updateScoreDisplay();
+    }
+  }
+}
+
 void updateMenu() {
   allOff();
-  // 底部蓝青色呼吸灯，提示玩家按键选歌
-  int pulse = (sin(millis() / 200.0) * 100) + 100;
+  
+  int pulse = (sin(millis() / 250.0) * 80) + 175; 
   for(int i=0; i<8; i++) {
-    strip.setPixelColor(ledMatrix[3][i], strip.Color(0, pulse / 2, pulse));
+    strip.setPixelColor(ledMatrix[3][i], strip.Color(pulse, pulse / 12, pulse / 5));
   }
   strip.show();
 
-  // 显示 "----" 代表等待选歌
   uint8_t data[] = { 0x40, 0x40, 0x40, 0x40 }; 
   display.setSegments(data);
 
   for(int c=0; c<8; c++) {
     if (keyJustPressed[c]) {
-      currentSong = c;          // 锁定选择的歌曲
-      meledyPtr = 0;            // 从第一句开始弹
-      score = 0;                // 分数清零
-      updateScoreDisplay();
-      initFourNotes();          // 重新生成掉落方块
-      
-      gameState = STATE_PLAYING;// 切换到游戏中状态
+      currentSong = c; 
+      meledyPtr = 0; 
+      score = 0;
+      maxScoreReached = 0;
+      updateScoreDisplay(); 
+      initFourNotes();
+      gameState = STATE_PLAYING; 
       lastMove = millis();
-      
-      playTone(KEY_FREQS[SONGS[c][0]-1], 150); // 弹一下第一颗音符
-      delay(500); // 停顿半秒，给玩家准备时间
+      playTone(KEY_FREQS[SONGS[c][0]-1], 150);
+      delay(500);
       return;
     }
   }
 }
 
-// ─── 胜利判定及动画 ──────────────────────────────────────────────────────
-void checkWinCondition() {
-  if (score >= 50) {
-    gameState = STATE_WIN;
-    winStartTime = millis();
-    
-    // 播放胜利通关音效 (登登登-灯!)
-    playTone(KEY_FREQS[0], 100); delay(100);
-    playTone(KEY_FREQS[2], 100); delay(100);
-    playTone(KEY_FREQS[4], 100); delay(100);
-    playTone(KEY_FREQS[7], 400); 
-  }
-}
-
 void updateWin() {
-  display.showNumberDec(100, false); // 固定显示100分
+  showNumberUpsideDown(150); 
   
-  // 彩虹炫光流水灯特效
   unsigned long now = millis();
-  long firstPixelHue = (now * 50) % 65536; 
   for(int i=0; i<strip.numPixels(); i++) {
-    int pixelHue = firstPixelHue + (i * 65536L / strip.numPixels());
-    strip.setPixelColor(i, strip.gamma32(strip.ColorHSV(pixelHue)));
+    long hue = 60000 + sin((now / 200.0) + (i * 0.3)) * 3000; 
+    float flash = (sin((now / 100.0) + (i * 0.6)) * 0.5) + 0.5; 
+    uint8_t val = 100 + (155 * flash); 
+    strip.setPixelColor(i, strip.gamma32(strip.ColorHSV(hue, 230, val)));
   }
   strip.show();
 
-  // 4秒后自动回到菜单页面
-  if (now - winStartTime > 4000) { 
+  if (now - stateStartTime > 4000) { 
     gameState = STATE_MENU;
   }
 }
 
-// ─── 游戏主逻辑 (同之前) ────────────────────────────────────────────────
+void updateGameOver() {
+  showNumberUpsideDown(0); 
+  allOff();
+  int flash = (millis() % 400 < 200) ? 150 : 0;
+  for(int i=0; i<LED_COUNT; i++) strip.setPixelColor(i, strip.Color(flash, 0, 0));
+  strip.show();
+  if (millis() - stateStartTime > 3000) gameState = STATE_MENU;
+}
+
 void updateNotes() {
   int cnt = 0;
   for (int i=0; i<MAX_NOTES; i++) {
@@ -253,7 +293,7 @@ void updateNotes() {
     notes[i].pos += speed;
     if (notes[i].hitState == 0 && notes[i].pos > HIT_END) {
       notes[i].hitState = 2; wrongPressTime[notes[i].col] = millis();
-      score -= 1; updateScoreDisplay();
+      score -= 1; updateScoreDisplay(); checkGameState();
     }
     if (notes[i].pos > 4.5f) { notes[i].active = false; }
   }
@@ -278,30 +318,30 @@ void checkTouch() {
       notes[i].hitState = 1;
       score += 2;             
       updateScoreDisplay();   
+      checkGameState();
+
       playNextSongNote();
       keyJustPressed[target] = false; 
 
-      render();   // 强制立刻把这一帧的绿灯刷出来
-      delay(80);  // 顿帧效果
+      render();   
+      delay(80);  
       
-      checkWinCondition(); // 检查是否达到100分
-      if (gameState != STATE_PLAYING) return; // 如果赢了，立刻停止后续判定
+      if (gameState != STATE_PLAYING) return;
 
     } else {
       for (int c=0; c<8; c++) {
         if (keyJustPressed[c]) {
           notes[i].hitState = 2; wrongPressTime[c] = millis();
-          score -= 1; updateScoreDisplay();
+          score -= 1; updateScoreDisplay(); checkGameState();
           keyJustPressed[c] = false;     
         }
       }
     }
   }
-  // 空挥判定
   for (int c=0; c<8; c++) {
     if (keyJustPressed[c]) {
       wrongPressTime[c] = millis();
-      score -= 1; updateScoreDisplay();
+      score -= 1; updateScoreDisplay(); checkGameState();
     }
   }
 }
@@ -340,11 +380,11 @@ void setup() {
   xTaskCreatePinnedToCore(audioTask, "audio", 4096, NULL, 5, NULL, 1);
   randomSeed(analogRead(A0));
   
-  gameState = STATE_MENU; // 开机直接进入菜单状态
+  gameState = STATE_MENU; 
 }
 
 void loop() {
-  readInputs(); // 【极其重要】全局统一扫描按键状态
+  readInputs(); 
 
   if (gameState == STATE_MENU) {
     updateMenu();
@@ -364,69 +404,7 @@ void loop() {
   else if (gameState == STATE_WIN) {
     updateWin();
   }
-}
-  
- /*
-
-  #include <Arduino.h>
-
-const int DAC_PIN = 25;
-const int SAMPLE_RATE = 8000;
-const int TABLE_SIZE = 256;
-
-uint8_t sineTable[TABLE_SIZE];
-
-hw_timer_t *timer = NULL;
-volatile uint16_t phase16 = 0;
-volatile uint16_t phaseInc16 = 0;
-volatile uint8_t amplitude = 80; // 0–127
-
-void IRAM_ATTR onTimer() {
-  uint8_t idx = phase16 >> 8;
-  uint8_t sample = 127 + (int8_t)(((int16_t)sineTable[idx] - 127) * amplitude / 127);
-  dacWrite(DAC_PIN, sample);
-  phase16 += phaseInc16;
-}
-
-// C2 major scale (two octaves lower)
-const float notes[] = {65.41, 73.42, 82.41, 87.31, 98.00, 110.00, 123.47, 130.81};
-const char* names[] = {"Do", "Re", "Mi", "Fa", "Sol", "La", "Ti", "Do"};
-const int NOTE_DURATION_MS = 500;
-const int NOTE_GAP_MS = 50;
-const int numNotes = sizeof(notes) / sizeof(notes[0]);
-
-void playNote(float freq) {
-  phaseInc16 = (uint16_t)(freq * TABLE_SIZE * 256.0f / SAMPLE_RATE);
-}
-
-void silence() {
-  phaseInc16 = 0;
-  dacWrite(DAC_PIN, 127); // rest at midpoint to avoid click
-}
-
-void setup() {
-  Serial.begin(115200);
-
-  for (int i = 0; i < TABLE_SIZE; i++) {
-    sineTable[i] = (uint8_t)(127 + 127 * sinf(2.0f * PI * i / TABLE_SIZE));
+  else if (gameState == STATE_GAMEOVER) {
+    updateGameOver();
   }
-
-  timer = timerBegin(0, 80, true);
-  timerAttachInterrupt(timer, &onTimer, true);
-  timerAlarmWrite(timer, 1000000 / SAMPLE_RATE, true);
-  timerAlarmEnable(timer);
 }
-
-void loop() {
-  for (int i = 0; i < numNotes; i++) {
-    Serial.println(names[i]);
-    playNote(notes[i]);
-    delay(NOTE_DURATION_MS);
-    silence();
-    delay(NOTE_GAP_MS);
-  }
-
-  delay(300);
-}
-  */
-  
